@@ -10,6 +10,7 @@ Enhancements in this fork:
 - Always emits pubDate per RSS item (Prowlarr requirement)
 - Optional parallel language hint enrichment (best-effort) while keeping extract_flat=True
   for the initial ytsearch for speed.
+- Always emits torznab:attr "languages" (fallback to "und" when unknown)
 
 Author: Ioannis Kokkinis (original)
 License: MIT
@@ -52,7 +53,7 @@ CONFIG = {
     # Language enrichment (best-effort)
     # Keep extract_flat=True for ytsearch (fast), and enrich top K in parallel
     "enable_language_hints": os.getenv("ENABLE_LANGUAGE_HINTS", "false").lower() in ("1", "true", "yes", "on"),
-    "lang_hint_max_enrich": int(os.getenv("LANG_HINT_MAX_ENRICH", "5")),
+    "lang_hint_max_enrich": int(os.getenv("LANG_HINT_MAX_ENRICH", "15")),  # <-- DEFAULT CHANGED TO 15
     "lang_hint_workers": int(os.getenv("LANG_HINT_WORKERS", "6")),
     "lang_hint_cache_ttl_sec": int(os.getenv("LANG_HINT_CACHE_TTL_SEC", "86400")),
     "yt_socket_timeout": int(os.getenv("YT_SOCKET_TIMEOUT", "15")),
@@ -152,7 +153,12 @@ def _extract_language_hints_for_url(url: str) -> Tuple[str, List[str]]:
     """
     Best-effort language extraction for a single YouTube URL using yt-dlp.
     Returns (primary_language, all_languages).
-    Primary language is best-effort (info.language if present, else first from hints).
+
+    Primary language is best-effort:
+      - info.language if present, else first from hints, else "".
+    Hints are derived from:
+      - subtitles keys
+      - automatic_captions keys
     """
     if not HAS_YTDLP or not url:
         return ("", [])
@@ -171,12 +177,10 @@ def _extract_language_hints_for_url(url: str) -> Tuple[str, List[str]]:
 
         langs = set()
 
-        # Direct field if present
         direct = info.get("language") or ""
         if direct:
             langs.add(str(direct))
 
-        # Captions/subtitles keys are language codes (best structured hint)
         for k in ("subtitles", "automatic_captions"):
             m = info.get(k) or {}
             if isinstance(m, dict):
@@ -205,8 +209,6 @@ def enrich_languages_parallel(videos: List[dict]) -> List[dict]:
     if k == 0:
         return videos
 
-    # Build tasks for first K videos
-    tasks = []
     now = time.time()
 
     def cached_lookup(video_id: str) -> Optional[Tuple[str, List[str]]]:
@@ -218,11 +220,9 @@ def enrich_languages_parallel(videos: List[dict]) -> List[dict]:
         ts, langs = cached
         if (now - ts) > CONFIG["lang_hint_cache_ttl_sec"]:
             return None
-        # primary = first element if list exists
         primary = langs[0] if langs else ""
         return (primary, langs)
 
-    # Fill from cache where possible; queue remaining
     to_enrich = []
     for i in range(k):
         vid = videos[i]
@@ -260,7 +260,6 @@ def enrich_languages_parallel(videos: List[dict]) -> List[dict]:
 
             video_id = vid.get("id", "")
             if video_id:
-                # store only all_langs; primary can be derived
                 _LANG_CACHE[video_id] = (time.time(), all_langs)
 
     return videos
@@ -358,18 +357,25 @@ def format_torznab_xml(videos: List[dict], query: str = "") -> str:
         SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {"name": "downloadvolumefactor", "value": "0"})
         SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {"name": "uploadvolumefactor", "value": "1"})
 
+        # ---------------------------------------------------------------------
         # Language attrs (best-effort)
-        # - language: a single "primary" value if we have it
-        # - languages: comma-separated hints (subtitles/auto-captions + possibly direct language)
+        # - ALWAYS emit languages (fallback "und" if unknown)
+        # - Emit language if we have a primary (direct or inferred)
+        # ---------------------------------------------------------------------
         primary_lang = (video.get("language") or "").strip()
         hints = video.get("language_hints") or []
-        if hints:
-            SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {
-                "name": "languages",
-                "value": ",".join(hints),
-            })
-            if not primary_lang:
-                primary_lang = hints[0]
+        hints = [h for h in hints if h]  # sanitize
+
+        # Always emit languages
+        languages_value = ",".join(hints) if hints else "und"
+        SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {
+            "name": "languages",
+            "value": languages_value,
+        })
+
+        # If we don't have a primary but we have hints, pick first as primary
+        if not primary_lang and hints:
+            primary_lang = hints[0]
 
         if primary_lang:
             SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {
@@ -500,8 +506,8 @@ def main():
 ║  API Path: /api                                              ║
 ║  API Key: {CONFIG["api_key"]}                                ║
 ║                                                              ║
-║  Language hints: {CONFIG["enable_language_hints"]}            ║
-║  (ENABLE_LANGUAGE_HINTS=true to enable)                      ║
+║  Language hints enabled: {CONFIG["enable_language_hints"]}    ║
+║  LANG_HINT_MAX_ENRICH default: {CONFIG["lang_hint_max_enrich"]}║
 ╚══════════════════════════════════════════════════════════════╝
 """)
 
