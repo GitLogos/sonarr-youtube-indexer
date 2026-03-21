@@ -16,7 +16,7 @@ import os
 import hashlib
 import urllib.parse
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from xml.etree.ElementTree import Element, SubElement, tostring
 import logging
@@ -90,7 +90,7 @@ def search_youtube(query: str, max_results: int = 20):
                         "channel": entry.get("channel", entry.get("uploader", "Unknown")),
                         "duration": entry.get("duration", 0),
                         "view_count": entry.get("view_count", 0),
-                        "upload_date": entry.get("upload_date", ""),
+                        "upload_date": entry.get("upload_date", ""),  # YYYYMMDD if present
                         "description": entry.get("description", ""),
                     })
 
@@ -117,6 +117,14 @@ def get_fallback_videos():
 def generate_guid(video_id: str):
     """Generate a unique GUID for a result."""
     return hashlib.md5(video_id.encode("utf-8")).hexdigest()
+
+
+def _rfc822(dt: datetime) -> str:
+    """Format a datetime as RFC-822 / RFC-1123 string for RSS pubDate."""
+    # Ensure there's a timezone offset in output
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.strftime("%a, %d %b %Y %H:%M:%S %z")
 
 
 def format_torznab_xml(videos, query: str = ""):
@@ -157,15 +165,21 @@ def format_torznab_xml(videos, query: str = ""):
         comments = SubElement(item, "comments")
         comments.text = f"Channel: {video.get('channel', 'Unknown')}"
 
-        # Publication date
-        upload_date = video.get("upload_date", "")
+        # ---------------------------------------------------------------------
+        # pubDate (REQUIRED by Prowlarr: every item must have a valid pubDate)
+        # Prefer yt-dlp upload_date (YYYYMMDD), otherwise fallback to now (UTC)
+        # ---------------------------------------------------------------------
+        upload_date = (video.get("upload_date") or "").strip()
         if upload_date:
             try:
-                pub_date = datetime.strptime(upload_date, "%Y%m%d")
-                pub_date_elem = SubElement(item, "pubDate")
-                pub_date_elem.text = pub_date.strftime("%a, %d %b %Y %H:%M:%S +0000")
+                pub_dt = datetime.strptime(upload_date, "%Y%m%d").replace(tzinfo=timezone.utc)
             except Exception:
-                pass
+                pub_dt = datetime.now(timezone.utc)
+        else:
+            pub_dt = datetime.now(timezone.utc)
+
+        pub_date_elem = SubElement(item, "pubDate")
+        pub_date_elem.text = _rfc822(pub_dt)
 
         # Size estimate: ~5MB per minute (roughly 720p-ish)
         duration = video.get("duration") or 600
@@ -254,10 +268,8 @@ class TorznabHandler(BaseHTTPRequestHandler):
 
         params = urllib.parse.parse_qs(parsed.query)
 
-        # Get API key
+        # API key
         apikey = params.get("apikey", [""])[0]
-
-        # Check API key
         if CONFIG["api_key"] and apikey != CONFIG["api_key"]:
             logger.warning(f"Invalid API key: {apikey}")
             self._send_error(100, "Invalid API Key")
@@ -267,7 +279,7 @@ class TorznabHandler(BaseHTTPRequestHandler):
         action = params.get("t", [""])[0].lower()
         logger.info(f"Request: action={action}, params={params}")
 
-        # If t is omitted, behave like caps (many clients probe this way)
+        # If t is omitted, behave like caps (some clients probe this way)
         if action in ("", "caps"):
             xml = '<?xml version="1.0" encoding="UTF-8"?>\n' + get_capabilities_xml()
             self._send_xml(xml)
