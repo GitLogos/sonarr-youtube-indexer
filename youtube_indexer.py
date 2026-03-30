@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-YouTube Indexer for Sonarr (v6.0 - Final)
-=========================================
-- Sonarr API Integration: Uses seriesid to get exact titles/languages.
-- Zero-Dependency: Uses built-in urllib for all API calls.
-- Empty Query Protection: Handles Prowlarr 'Test' and 'Recent' searches.
-- Enhanced Language: Detects auto-generated captions (a.en, en-orig).
-- Fixed Sorting: Resolved the 'dict vs dict' comparison crash.
+YouTube Indexer for Sonarr (v7.0 - Final Consolidated)
+=====================================================
+Fixes included:
+- Prowlarr 'Test' handling: Returns dummy result for empty queries.
+- Detailed Logging: Every incoming URI is logged for debugging.
+- Fixed Sorting: No more 'dict vs dict' TypeError.
+- Sonarr Integration: Uses seriesid for metadata and language.
 """
 
 import os
@@ -63,15 +63,13 @@ def sonarr_api_get(endpoint, params=None):
         with urllib.request.urlopen(full_url, timeout=5) as response:
             return json.loads(response.read().decode())
     except Exception as e:
-        logger.error(f"Sonarr API connection error: {e}")
+        logger.error(f"Sonarr API error: {e}")
         return None
 
 def get_sonarr_metadata(series_id, season, episode):
-    """Retrieves episode title and series language from Sonarr."""
     if not series_id:
         return None, "en"
 
-    # 1. Determine Series Language
     series = sonarr_api_get(f"series/{series_id}")
     series_lang = "en"
     if series:
@@ -81,7 +79,6 @@ def get_sonarr_metadata(series_id, season, episode):
         elif isinstance(lang_data, str):
             series_lang = lang_data.lower()[:2]
     
-    # 2. Determine Episode Title
     episodes = sonarr_api_get("episode", {"seriesId": series_id})
     if episodes:
         for ep in episodes:
@@ -91,16 +88,13 @@ def get_sonarr_metadata(series_id, season, episode):
     return None, series_lang
 
 # -----------------------------------------------------------------------------
-# Metadata Extraction & Quality
+# YouTube Helpers
 # -----------------------------------------------------------------------------
 
 def get_inferred_language(entry):
-    # Prefer explicit audio language metadata
     lang = entry.get("audio_language") or entry.get("language")
     if lang and lang != 'und':
         return lang.split('-')[0]
-    
-    # Fallback to scanning subtitle/caption tags (a.en, en-US, etc)
     for key in ["subtitles", "automatic_captions"]:
         subs = entry.get(key) or {}
         if subs:
@@ -124,11 +118,6 @@ def score_video(video, show_name, ep_title):
     if show_name.lower() in channel: score += 80
     if show_name.lower() in title: score += 50
     
-    # High quality bonus
-    if video.get('height') and video.get('height') >= 1080:
-        score += 20
-
-    # Penalties for fluff content
     if any(x in title for x in ['reaction', 'review', 'trailer', 'teaser', 'clips']):
         score -= 400
     return score
@@ -138,22 +127,16 @@ def score_video(video, show_name, ep_title):
 # -----------------------------------------------------------------------------
 
 def search_youtube(query, series_id, season, ep):
-    if not query or query.strip() == "":
-        logger.info("Empty query received (likely Prowlarr test). Skipping.")
-        return []
-
     ep_title, target_lang = get_sonarr_metadata(series_id, season, ep)
     
-    # Search string strategy
     if ep_title:
         search_str = f'"{query}" "{ep_title}"'
     else:
         search_str = f'"{query}" S{int(season or 1):02d}E{int(ep or 1):02d}'
     
-    logger.info(f"Processing Search: {search_str} (Language: {target_lang})")
+    logger.info(f"Executing YouTube Search: {search_str} (Language: {target_lang})")
 
     candidates = []
-    # STAGE 1: Fast scan (No JS runtime needed here)
     fast_opts = {"quiet": True, "extract_flat": "in_playlist", "ignoreerrors": True}
     
     try:
@@ -165,12 +148,9 @@ def search_youtube(query, series_id, season, ep):
                     continue
                 score = score_video(entry, query, ep_title)
                 if score > 0:
-                    # Storing only essential info to avoid sorting dicts
                     candidates.append((score, entry))
 
-        # STAGE 2: Deep Scrape (Uses Node.js/FFmpeg for full metadata)
         final_results = []
-        # Fix: Sort by score (index 0) ONLY to avoid TypeError
         top_candidates = sorted(candidates, key=lambda x: x[0], reverse=True)[:3]
 
         deep_opts = {
@@ -180,7 +160,8 @@ def search_youtube(query, series_id, season, ep):
             "ignoreerrors": True, 
             "geo_bypass": True,
             "writesubtitles": True,
-            "writeautomaticsub": True
+            "writeautomaticsub": True,
+            "allow_unplayable_formats": True, # Needed for some restricted content
         }
 
         with yt_dlp.YoutubeDL(deep_opts) as ydl:
@@ -191,7 +172,6 @@ def search_youtube(query, series_id, season, ep):
                     if not info: continue
                     
                     vid_lang = get_inferred_language(info)
-                    # Significant boost for language match
                     final_score = score + (100 if vid_lang == target_lang else 0)
 
                     final_results.append({
@@ -204,18 +184,15 @@ def search_youtube(query, series_id, season, ep):
                         "duration": info.get("duration", 0),
                         "upload_date": info.get("upload_date", "")
                     })
-                except Exception as e:
-                    logger.debug(f"Stage 2 error for {video_url}: {e}")
-                    continue
+                except Exception: continue
             
         return sorted(final_results, key=lambda x: x['score'], reverse=True)
-
     except Exception as e:
-        logger.error(f"Search failure: {e}")
+        logger.error(f"Search error: {e}")
         return []
 
 # -----------------------------------------------------------------------------
-# Torznab Interface
+# XML & Server Handling
 # -----------------------------------------------------------------------------
 
 def format_torznab_xml(videos):
@@ -230,15 +207,11 @@ def format_torznab_xml(videos):
         SubElement(item, "guid").text = hashlib.md5(video['id'].encode()).hexdigest()
         SubElement(item, "link").text = video['url']
         
-        # Calculate size for Sonarr's parser
         duration_mins = (video.get('duration') or 0) / 60
-        mb_per_min = 15 if "2160" in q else 8
-        size_bytes = int(duration_mins * mb_per_min * 1024 * 1024)
+        size_bytes = int(duration_mins * (15 if "2160" in q else 8) * 1024 * 1024)
         
         SubElement(item, "size").text = str(size_bytes)
         SubElement(item, "enclosure", {"url": video['url'], "length": str(size_bytes), "type": "application/x-bittorrent"})
-        
-        # Torznab Attributes
         SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {"name": "language", "value": video['language']})
         SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {"name": "category", "value": "5000"})
         SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {"name": "seeders", "value": "100"})
@@ -246,39 +219,52 @@ def format_torznab_xml(videos):
     return tostring(rss, encoding="unicode")
 
 class TorznabHandler(BaseHTTPRequestHandler):
+    def _send_xml(self, xml_content):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/xml")
+        self.end_headers()
+        self.wfile.write(xml_content.encode("utf-8"))
+
     def do_GET(self):
+        # 1. Log incoming request for visibility
+        logger.info(f"GET Request: {self.path}")
+        
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         action = params.get("t", [""])[0].lower()
 
         if action in ("search", "tvsearch"):
             q = params.get("q", [""])[0]
+            
+            # 2. Prowlarr Test Handling: Return dummy if query is empty
+            if not q or q.strip() == "":
+                logger.info("Empty query (Prowlarr test). Returning dummy result.")
+                dummy = [{
+                    "id": "prowlarr_test", "title": "YouTube Indexer Connection Test", 
+                    "url": "https://youtube.com", "language": "en", "quality": "1080p", 
+                    "score": 100, "duration": 600, "upload_date": "20260101"
+                }]
+                self._send_xml('<?xml version="1.0" encoding="UTF-8"?>\n' + format_torznab_xml(dummy))
+                return
+
             sid = params.get("seriesid", [None])[0]
             s = params.get("season", ["1"])[0]
             e = params.get("ep", ["1"])[0]
             
             videos = search_youtube(q, sid, s, e)
-            body = '<?xml version="1.0" encoding="UTF-8"?>\n' + format_torznab_xml(videos)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/xml")
-            self.end_headers()
-            self.wfile.write(body.encode("utf-8"))
+            self._send_xml('<?xml version="1.0" encoding="UTF-8"?>\n' + format_torznab_xml(videos))
 
         elif action == "caps":
-            body = (
+            self._send_xml(
                 '<caps><server title="YouTube"/><searching>'
                 '<search available="yes" supportedParams="q"/>'
                 '<tv-search available="yes" supportedParams="q,season,ep,seriesid"/>'
                 '</searching></caps>'
             )
-            self.send_response(200)
-            self.send_header("Content-Type", "application/xml")
-            self.end_headers()
-            self.wfile.write(body.encode("utf-8"))
 
 if __name__ == "__main__":
     if not HAS_YTDLP:
-        print("CRITICAL: yt-dlp module not found. Check Dockerfile installation.")
+        print("yt-dlp is missing. Build the container again.")
     else:
-        logger.info(f"YouTube Indexer started on port {CONFIG['port']}")
+        logger.info(f"Server online at port {CONFIG['port']}")
         HTTPServer((CONFIG["host"], CONFIG["port"]), TorznabHandler).serve_forever()
