@@ -10,6 +10,7 @@ LABEL description="YouTube Indexer for Prowlarr/Sonarr - Torznab-compatible API"
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     nodejs \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Update pip and install yt-dlp
