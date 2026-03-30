@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-YouTube Indexer for Sonarr (v5.0 - Fixed Sorting & Enhanced Language)
+YouTube Indexer for Sonarr (v6.0 - Final)
+=========================================
+- Sonarr API Integration: Uses seriesid to get exact titles/languages.
+- Zero-Dependency: Uses built-in urllib for all API calls.
+- Empty Query Protection: Handles Prowlarr 'Test' and 'Recent' searches.
+- Enhanced Language: Detects auto-generated captions (a.en, en-orig).
+- Fixed Sorting: Resolved the 'dict vs dict' comparison crash.
 """
 
 import os
@@ -15,12 +21,16 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from xml.etree.ElementTree import Element, SubElement, tostring
 import logging
 
+# Check for yt-dlp
 try:
     import yt_dlp
     HAS_YTDLP = True
 except ImportError:
     HAS_YTDLP = False
 
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
 CONFIG = {
     "host": os.getenv("HOST", "0.0.0.0"),
     "port": int(os.getenv("PORT", "9117")),
@@ -43,7 +53,8 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 
 def sonarr_api_get(endpoint, params=None):
-    if not CONFIG["sonarr_api_key"]: return None
+    if not CONFIG["sonarr_api_key"]:
+        return None
     url = f"{CONFIG['sonarr_url'].rstrip('/')}/api/v3/{endpoint}"
     params = params or {}
     params["apikey"] = CONFIG["sonarr_api_key"]
@@ -52,25 +63,25 @@ def sonarr_api_get(endpoint, params=None):
         with urllib.request.urlopen(full_url, timeout=5) as response:
             return json.loads(response.read().decode())
     except Exception as e:
-        logger.error(f"Sonarr API error ({endpoint}): {e}")
+        logger.error(f"Sonarr API connection error: {e}")
         return None
 
 def get_sonarr_metadata(series_id, season, episode):
     """Retrieves episode title and series language from Sonarr."""
-    if not series_id: return None, "en"
+    if not series_id:
+        return None, "en"
 
-    # 1. Get Series Language
+    # 1. Determine Series Language
     series = sonarr_api_get(f"series/{series_id}")
     series_lang = "en"
     if series:
-        # Sonarr v4/v3 structure check
         lang_data = series.get('languageProfile') or series.get('language')
         if isinstance(lang_data, dict):
             series_lang = lang_data.get('name', 'en').lower()[:2]
         elif isinstance(lang_data, str):
             series_lang = lang_data.lower()[:2]
     
-    # 2. Get Episode Title
+    # 2. Determine Episode Title
     episodes = sonarr_api_get("episode", {"seriesId": series_id})
     if episodes:
         for ep in episodes:
@@ -80,17 +91,21 @@ def get_sonarr_metadata(series_id, season, episode):
     return None, series_lang
 
 # -----------------------------------------------------------------------------
-# YouTube Metadata Helpers
+# Metadata Extraction & Quality
 # -----------------------------------------------------------------------------
 
 def get_inferred_language(entry):
+    # Prefer explicit audio language metadata
     lang = entry.get("audio_language") or entry.get("language")
     if lang and lang != 'und':
         return lang.split('-')[0]
+    
+    # Fallback to scanning subtitle/caption tags (a.en, en-US, etc)
     for key in ["subtitles", "automatic_captions"]:
         subs = entry.get(key) or {}
         if subs:
-            return list(subs.keys())[0].replace('a.', '').split('-')[0]
+            raw_key = list(subs.keys())[0]
+            return raw_key.replace('a.', '').split('-')[0]
     return "en"
 
 def get_video_quality(entry):
@@ -100,7 +115,7 @@ def get_video_quality(entry):
     if h >= 720:  return "720p"
     return "480p"
 
-def score_video(video, show_name, ep_title, series_lang):
+def score_video(video, show_name, ep_title):
     score = 0
     title = video.get("title", "").lower()
     channel = video.get("channel", "").lower()
@@ -109,62 +124,98 @@ def score_video(video, show_name, ep_title, series_lang):
     if show_name.lower() in channel: score += 80
     if show_name.lower() in title: score += 50
     
-    if any(x in title for x in ['reaction', 'review', 'trailer', 'teaser']): score -= 400
+    # High quality bonus
+    if video.get('height') and video.get('height') >= 1080:
+        score += 20
+
+    # Penalties for fluff content
+    if any(x in title for x in ['reaction', 'review', 'trailer', 'teaser', 'clips']):
+        score -= 400
     return score
 
 # -----------------------------------------------------------------------------
-# Search Logic
+# Core Search Logic
 # -----------------------------------------------------------------------------
 
 def search_youtube(query, series_id, season, ep):
+    if not query or query.strip() == "":
+        logger.info("Empty query received (likely Prowlarr test). Skipping.")
+        return []
+
     ep_title, target_lang = get_sonarr_metadata(series_id, season, ep)
     
-    search_str = f'"{query}" "{ep_title}"' if ep_title else f'"{query}" S{int(season or 1):02d}E{int(ep or 1):02d}'
-    logger.info(f"Searching: {search_str} (Target Lang: {target_lang})")
+    # Search string strategy
+    if ep_title:
+        search_str = f'"{query}" "{ep_title}"'
+    else:
+        search_str = f'"{query}" S{int(season or 1):02d}E{int(ep or 1):02d}'
+    
+    logger.info(f"Processing Search: {search_str} (Language: {target_lang})")
 
     candidates = []
+    # STAGE 1: Fast scan (No JS runtime needed here)
     fast_opts = {"quiet": True, "extract_flat": "in_playlist", "ignoreerrors": True}
     
-    with yt_dlp.YoutubeDL(fast_opts) as ydl:
-        res = ydl.extract_info(f"ytsearch10:{search_str}", download=False)
-        for entry in res.get("entries", []):
-            if not entry: continue
-            if entry.get("duration") and entry.get("duration") < CONFIG["min_duration"]: continue
-            score = score_video(entry, query, ep_title, target_lang)
-            if score > 0: 
-                candidates.append((score, entry))
+    try:
+        with yt_dlp.YoutubeDL(fast_opts) as ydl:
+            res = ydl.extract_info(f"ytsearch10:{search_str}", download=False)
+            for entry in res.get("entries", []):
+                if not entry: continue
+                if entry.get("duration") and entry.get("duration") < CONFIG["min_duration"]:
+                    continue
+                score = score_video(entry, query, ep_title)
+                if score > 0:
+                    # Storing only essential info to avoid sorting dicts
+                    candidates.append((score, entry))
 
-    final_results = []
-    deep_opts = {"quiet": True, "extract_flat": False, "skip_download": True, "ignoreerrors": True, "geo_bypass": True}
-    
-    # FIX: Use key lambda to sort ONLY by the score to avoid dict comparison crash
-    top_candidates = sorted(candidates, key=lambda x: x[0], reverse=True)[:3]
+        # STAGE 2: Deep Scrape (Uses Node.js/FFmpeg for full metadata)
+        final_results = []
+        # Fix: Sort by score (index 0) ONLY to avoid TypeError
+        top_candidates = sorted(candidates, key=lambda x: x[0], reverse=True)[:3]
 
-    with yt_dlp.YoutubeDL(deep_opts) as ydl:
-        for score, fast_entry in top_candidates:
-            try:
-                info = ydl.extract_info(fast_entry.get('url') or f"https://www.youtube.com/watch?v={fast_entry['id']}", download=False)
-                if not info: continue
-                
-                vid_lang = get_inferred_language(info)
-                final_score = score + (100 if vid_lang == target_lang else 0)
+        deep_opts = {
+            "quiet": True, 
+            "extract_flat": False, 
+            "skip_download": True, 
+            "ignoreerrors": True, 
+            "geo_bypass": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True
+        }
 
-                final_results.append({
-                    "id": info['id'],
-                    "title": info['title'],
-                    "url": info.get('webpage_url'),
-                    "language": vid_lang,
-                    "quality": get_video_quality(info),
-                    "score": final_score,
-                    "duration": info.get("duration", 0),
-                    "upload_date": info.get("upload_date", "")
-                })
-            except Exception: continue
+        with yt_dlp.YoutubeDL(deep_opts) as ydl:
+            for score, fast_entry in top_candidates:
+                try:
+                    video_url = fast_entry.get('url') or f"https://www.youtube.com/watch?v={fast_entry['id']}"
+                    info = ydl.extract_info(video_url, download=False)
+                    if not info: continue
+                    
+                    vid_lang = get_inferred_language(info)
+                    # Significant boost for language match
+                    final_score = score + (100 if vid_lang == target_lang else 0)
+
+                    final_results.append({
+                        "id": info['id'],
+                        "title": info['title'],
+                        "url": info.get('webpage_url', video_url),
+                        "language": vid_lang,
+                        "quality": get_video_quality(info),
+                        "score": final_score,
+                        "duration": info.get("duration", 0),
+                        "upload_date": info.get("upload_date", "")
+                    })
+                except Exception as e:
+                    logger.debug(f"Stage 2 error for {video_url}: {e}")
+                    continue
             
-    return sorted(final_results, key=lambda x: x['score'], reverse=True)
+        return sorted(final_results, key=lambda x: x['score'], reverse=True)
+
+    except Exception as e:
+        logger.error(f"Search failure: {e}")
+        return []
 
 # -----------------------------------------------------------------------------
-# Server
+# Torznab Interface
 # -----------------------------------------------------------------------------
 
 def format_torznab_xml(videos):
@@ -179,13 +230,18 @@ def format_torznab_xml(videos):
         SubElement(item, "guid").text = hashlib.md5(video['id'].encode()).hexdigest()
         SubElement(item, "link").text = video['url']
         
-        duration_mins = (video['duration'] or 0) / 60
-        size = int(duration_mins * (15 if "2160" in q else 8) * 1024 * 1024)
-        SubElement(item, "size").text = str(size)
-        SubElement(item, "enclosure", {"url": video['url'], "length": str(size), "type": "application/x-bittorrent"})
+        # Calculate size for Sonarr's parser
+        duration_mins = (video.get('duration') or 0) / 60
+        mb_per_min = 15 if "2160" in q else 8
+        size_bytes = int(duration_mins * mb_per_min * 1024 * 1024)
         
+        SubElement(item, "size").text = str(size_bytes)
+        SubElement(item, "enclosure", {"url": video['url'], "length": str(size_bytes), "type": "application/x-bittorrent"})
+        
+        # Torznab Attributes
         SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {"name": "language", "value": video['language']})
         SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {"name": "category", "value": "5000"})
+        SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {"name": "seeders", "value": "100"})
 
     return tostring(rss, encoding="unicode")
 
@@ -207,8 +263,14 @@ class TorznabHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/xml")
             self.end_headers()
             self.wfile.write(body.encode("utf-8"))
+
         elif action == "caps":
-            body = '<caps><server title="YouTube"/><searching><tv-search available="yes" supportedParams="q,season,ep,seriesid"/></searching></caps>'
+            body = (
+                '<caps><server title="YouTube"/><searching>'
+                '<search available="yes" supportedParams="q"/>'
+                '<tv-search available="yes" supportedParams="q,season,ep,seriesid"/>'
+                '</searching></caps>'
+            )
             self.send_response(200)
             self.send_header("Content-Type", "application/xml")
             self.end_headers()
@@ -216,6 +278,7 @@ class TorznabHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     if not HAS_YTDLP:
-        print("Install yt-dlp.")
+        print("CRITICAL: yt-dlp module not found. Check Dockerfile installation.")
     else:
+        logger.info(f"YouTube Indexer started on port {CONFIG['port']}")
         HTTPServer((CONFIG["host"], CONFIG["port"]), TorznabHandler).serve_forever()
