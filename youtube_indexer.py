@@ -281,6 +281,16 @@ class TorznabHandler(BaseHTTPRequestHandler):
         logger.info(f"GET Request: {self.path}")
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
+
+        # API key required
+        provided_key = params.get("apikey", [None])[0]
+        if CONFIG["api_key"] and provided_key != CONFIG["api_key"]:
+            self.send_response(403)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Forbidden: invalid API key")
+            return
+
         action = params.get("t", [""])[0].lower()
 
         if action in ("search", "tvsearch"):
