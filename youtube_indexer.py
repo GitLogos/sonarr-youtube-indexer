@@ -113,21 +113,39 @@ def get_sonarr_metadata(series_id, season, episode):
     return None, series_lang
 
 def get_inferred_language(entry):
-    preferred = entry.get("audio_language") or entry.get("language")
-    if preferred and preferred.lower() != 'und':
-        return preferred.split('-')[0].lower()
+    if not isinstance(entry, dict):
+        return "en"
 
-    for key in ["automatic_captions", "subtitles"]:
-        caps = entry.get(key) or {}
-        if isinstance(caps, dict) and caps:
+    candidates = []
+    for field in ["audio_language", "language"]:
+        val = entry.get(field)
+        if val and isinstance(val, str) and val.lower() != 'und':
+            candidates.append(val)
+
+    for cap_field in ["automatic_captions", "subtitles", "requested_auto_subtitles", "requested_subtitles"]:
+        caps = entry.get(cap_field) or {}
+        if isinstance(caps, dict):
             for raw_key in caps.keys():
                 if not raw_key:
                     continue
-                lang_code = raw_key.replace('a.', '').split('-')[0].lower()
-                if lang_code and lang_code != 'und':
-                    return lang_code
+                code = raw_key.replace('a.', '').split('-')[0].lower()
+                if code and code != 'und':
+                    candidates.append(code)
 
-    # last resort
+    if not candidates:
+        formats = entry.get('formats') or []
+        for f in formats:
+            if isinstance(f, dict):
+                audio_lang = f.get('language') or f.get('audio_language')
+                if audio_lang and isinstance(audio_lang, str) and audio_lang.lower() != 'und':
+                    candidates.append(audio_lang)
+
+    if candidates:
+        for candidate in candidates:
+            code = candidate.split('-')[0].lower()
+            if code and code != 'und':
+                return code
+
     return "en"
 
 def get_video_quality(entry):
@@ -200,7 +218,7 @@ def search_youtube(query, series_id, season, ep):
             candidates.append((score, entry))
 
     final_results = []
-    top_candidates = sorted(candidates, key=lambda x: x[0], reverse=True)[:5]
+    top_candidates = sorted(candidates, key=lambda x: x[0], reverse=True)[:10]
     deep_opts = {
         "quiet": True,
         "ignoreerrors": True,
@@ -212,30 +230,87 @@ def search_youtube(query, series_id, season, ep):
 
     with yt_dlp.YoutubeDL(deep_opts) as ydl:
         for score, fast_entry in top_candidates:
+            if not fast_entry:
+                continue
             try:
                 video_id = fast_entry.get('id') or fast_entry.get('url')
                 if not video_id:
                     continue
                 v_url = fast_entry.get('url') or f"https://www.youtube.com/watch?v={video_id}"
                 info = ydl.extract_info(v_url, download=False)
-                if not info:
-                    continue
 
-                vid_lang = get_inferred_language(info)
-                final_results.append({
-                    "id": info.get('id', video_id),
-                    "title": info.get('title', 'Unknown Title'),
-                    "url": info.get('webpage_url', v_url),
-                    "language": vid_lang,
-                    "quality": get_video_quality(info),
-                    "score": score + (100 if vid_lang == target_lang else 0),
-                    "duration": info.get('duration', 0),
-                    "upload_date": info.get('upload_date', '')
-                })
+                if info and isinstance(info, dict):
+                    vid_lang = get_inferred_language(info)
+                    final_results.append({
+                        "id": info.get('id', video_id),
+                        "title": info.get('title', 'Unknown Title'),
+                        "url": info.get('webpage_url', v_url),
+                        "language": vid_lang,
+                        "quality": get_video_quality(info),
+                        "score": score + (100 if vid_lang == target_lang else 0),
+                        "duration": info.get('duration', 0),
+                        "upload_date": info.get('upload_date', '')
+                    })
+                else:
+                    fallback_lang = get_inferred_language(fast_entry)
+                    final_results.append({
+                        "id": video_id,
+                        "title": fast_entry.get('title', 'Unknown Title'),
+                        "url": v_url,
+                        "language": fallback_lang,
+                        "quality": get_video_quality(fast_entry),
+                        "score": score + (100 if fallback_lang == target_lang else 0),
+                        "duration": fast_entry.get('duration', 0),
+                        "upload_date": fast_entry.get('upload_date', '')
+                    })
             except Exception as e:
                 logger.warning(f"yt-dlp candidate detail fetch failed for {fast_entry.get('id')}: {e}")
+                fallback_lang = get_inferred_language(fast_entry)
+                final_results.append({
+                    "id": fast_entry.get('id', ''),
+                    "title": fast_entry.get('title', 'Unknown Title'),
+                    "url": fast_entry.get('url', f"https://www.youtube.com/watch?v={fast_entry.get('id')}"),
+                    "language": fallback_lang,
+                    "quality": get_video_quality(fast_entry),
+                    "score": score + (100 if fallback_lang == target_lang else 0),
+                    "duration": fast_entry.get('duration', 0),
+                    "upload_date": fast_entry.get('upload_date', '')
+                })
 
-    return sorted(final_results, key=lambda x: x['score'], reverse=True)
+    # Ensure at least 5 non-duplicate results
+    final_results_sorted = sorted(final_results, key=lambda x: x['score'], reverse=True)
+    unique = []
+    seen = set()
+    for r in final_results_sorted:
+        if r['id'] in seen:
+            continue
+        seen.add(r['id'])
+        unique.append(r)
+        if len(unique) >= 5:
+            break
+
+    # if still less than 5, include lower scored fast candidates as minimal entries
+    if len(unique) < 5:
+        for score, fast_entry in top_candidates:
+            vid_id = fast_entry.get('id') or fast_entry.get('url')
+            if vid_id in seen:
+                continue
+            fallback_lang = get_inferred_language(fast_entry)
+            unique.append({
+                "id": vid_id,
+                "title": fast_entry.get('title', 'Unknown Title'),
+                "url": fast_entry.get('url', f"https://www.youtube.com/watch?v={vid_id}"),
+                "language": fallback_lang,
+                "quality": get_video_quality(fast_entry),
+                "score": score + (100 if fallback_lang == target_lang else 0),
+                "duration": fast_entry.get('duration', 0),
+                "upload_date": fast_entry.get('upload_date', '')
+            })
+            seen.add(vid_id)
+            if len(unique) >= 5:
+                break
+
+    return unique
 
 # -----------------------------------------------------------------------------
 # XML & Server
@@ -257,6 +332,8 @@ def format_torznab_xml(videos):
         SubElement(item, "guid").text = hashlib.md5(guid_value.encode('utf-8')).hexdigest()
         SubElement(item, "link").text = video.get('url', '')
         SubElement(item, "pubDate").text = format_rfc822_date(video.get('upload_date'))
+        description_text = f"lang={video.get('language','en')} duration={video.get('duration',0)}s quality={q}"
+        SubElement(item, "description").text = description_text
 
         duration_secs = video.get('duration') or 0
         duration_mins = max(duration_secs / 60.0, 1)
