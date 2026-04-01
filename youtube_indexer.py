@@ -172,18 +172,32 @@ def get_inferred_language(entry):
         return "en"
 
     candidates = []
+
+    # 1) explicitly provided by yt-dlp for audio track language
     for field in ["audio_language", "language"]:
         val = entry.get(field)
         if val and isinstance(val, str) and val.lower() != 'und':
             candidates.append(val)
 
-    for cap_field in ["automatic_captions", "subtitles", "requested_auto_subtitles", "requested_subtitles"]:
+    # 2) automatic captions are best source for user visible language
+    for cap_field in ["automatic_captions", "requested_auto_subtitles"]:
         caps = entry.get(cap_field) or {}
         if isinstance(caps, dict):
             for raw_key in caps.keys():
                 if not raw_key:
                     continue
                 code = raw_key.replace('a.', '').split('-')[0].lower()
+                if code and code != 'und':
+                    candidates.append(code)
+
+    # 3) fallback on explicit subtitles if no auto available
+    for cap_field in ["subtitles", "requested_subtitles"]:
+        caps = entry.get(cap_field) or {}
+        if isinstance(caps, dict):
+            for raw_key in caps.keys():
+                if not raw_key:
+                    continue
+                code = raw_key.split('-')[0].lower()
                 if code and code != 'und':
                     candidates.append(code)
 
@@ -260,6 +274,8 @@ def search_youtube(query, series_id, season, ep):
         "noplaylist": True,
         "extract_flat": "in_playlist",
         "skip_download": True,
+        "allsubtitles": True,
+        "writeautomaticsub": False,
     }
 
     with yt_dlp.YoutubeDL(fast_opts) as ydl:
@@ -291,6 +307,8 @@ def search_youtube(query, series_id, season, ep):
         "noplaylist": True,
         "geo_bypass": True,
         "source_address": "0.0.0.0",
+        "allsubtitles": True,
+        "writeautomaticsub": False,
     }
 
     with yt_dlp.YoutubeDL(deep_opts) as ydl:
