@@ -282,24 +282,7 @@ class TorznabHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
 
-        # API key can come via query or header from Prowlarr.
-        provided_key = params.get("apikey", [None])[0]
-        if provided_key is None:
-            provided_key = (
-                self.headers.get("X-Api-Key")
-                or self.headers.get("X-API-Key")
-                or self.headers.get("Api-Key")
-            )
-
-        logger.debug(f"API key check provided={provided_key} expected={CONFIG.get('api_key')}")
-
-        if CONFIG.get("api_key") and provided_key is not None and provided_key != CONFIG.get("api_key"):
-            self.send_response(403)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(b"Forbidden: invalid API key")
-            return
-
+        # API key authentication is disabled to allow open access during troubleshooting.
         action = params.get("t", [""])[0].lower()
 
         if action in ("search", "tvsearch"):
