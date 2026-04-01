@@ -37,6 +37,7 @@ CONFIG = {
     "indexer_name": os.getenv("INDEXER_NAME", "YouTube"),
     "log_level": os.getenv("LOG_LEVEL", "INFO"),
     "min_duration": int(os.getenv("MIN_DURATION", "300")),
+    "tmdb_api_key": os.getenv("TMDB_API_KEY", ""),
 }
 
 logging.basicConfig(
@@ -88,29 +89,83 @@ def sonarr_api_get(endpoint, params=None):
 
 def get_sonarr_metadata(series_id, season, episode):
     if not series_id:
-        return None, "en"
+        return None, "en", None, None
 
     try:
         series_id = int(series_id)
     except (TypeError, ValueError):
-        return None, "en"
+        return None, "en", None, None
 
     series = sonarr_api_get(f"series/{series_id}")
-    series_lang = "en"
+    story_lang = "en"
+    series_title = None
+    series_tvdb_id = None
     if series:
+        series_title = series.get('title') or series.get('titleSlug') or series.get('seriesName')
+        series_tvdb_id = series.get('tvdbId') or series.get('tvdb_id')
+
         lang_data = series.get('languageProfile') or series.get('language')
         if isinstance(lang_data, dict):
-            series_lang = lang_data.get('name', 'en').lower()[:2]
+            story_lang = lang_data.get('name', 'en').lower()[:2]
         elif isinstance(lang_data, str):
-            series_lang = lang_data.lower()[:2]
+            story_lang = lang_data.lower()[:2]
 
+    ep_title = None
     episodes = sonarr_api_get("episode", {"seriesId": series_id})
     if episodes:
         for ep_data in episodes:
             if str(ep_data.get('seasonNumber')) == str(season) and str(ep_data.get('episodeNumber')) == str(episode):
-                return ep_data.get('title'), series_lang
+                ep_title = ep_data.get('title')
+                break
 
-    return None, series_lang
+    return ep_title, story_lang, series_title, series_tvdb_id
+
+def get_tmdb_series_id(series_title, tvdb_id):
+    api_key = CONFIG.get("tmdb_api_key")
+    if not api_key:
+        return None
+
+    try:
+        if tvdb_id:
+            url = f"https://api.themoviedb.org/3/find/{tvdb_id}?api_key={api_key}&external_source=tvdb_id"
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                tv_results = data.get("tv_results") or []
+                if tv_results:
+                    return tv_results[0].get('id')
+
+        if series_title:
+            query = urllib.parse.quote(series_title)
+            url = f"https://api.themoviedb.org/3/search/tv?api_key={api_key}&query={query}"
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                results = data.get("results") or []
+                if results:
+                    return results[0].get('id')
+    except Exception as e:
+        logger.warning(f"TMDB series lookup failed: {e}")
+
+    return None
+
+
+def get_tmdb_episode_name(tmdb_series_id, season, episode, language):
+    api_key = CONFIG.get("tmdb_api_key")
+    if not api_key or not tmdb_series_id:
+        return None
+
+    try:
+        lang = language or "en"
+        url = f"https://api.themoviedb.org/3/tv/{tmdb_series_id}/season/{season}/episode/{episode}?api_key={api_key}&language={lang}"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            name = data.get('name')
+            if name:
+                return name
+    except Exception as e:
+        logger.warning(f"TMDB episode lookup failed: {e}")
+
+    return None
+
 
 def get_inferred_language(entry):
     if not isinstance(entry, dict):
@@ -184,7 +239,17 @@ def search_youtube(query, series_id, season, ep):
     except (TypeError, ValueError):
         ep_int = 1
 
-    ep_title, target_lang = get_sonarr_metadata(series_id, season_int, ep_int)
+    ep_title, target_lang, series_title, series_tvdb_id = get_sonarr_metadata(series_id, season_int, ep_int)
+
+    tmdb_series_id = get_tmdb_series_id(series_title, series_tvdb_id)
+    if tmdb_series_id and target_lang:
+        tmdb_name = get_tmdb_episode_name(tmdb_series_id, season_int, ep_int, target_lang)
+        if tmdb_name:
+            ep_title = tmdb_name
+
+    if not ep_title and series_title:
+        ep_title = f"{series_title} S{season_int:02d}E{ep_int:02d}"
+
     search_str = f'"{query}" "{ep_title}"' if ep_title else f'"{query}" S{season_int:02d}E{ep_int:02d}'
     logger.info(f"Executing Search: {search_str} (Lang: {target_lang})")
 
