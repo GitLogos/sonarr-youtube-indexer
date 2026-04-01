@@ -50,15 +50,28 @@ logger = logging.getLogger(__name__)
 # -----------------------------------------------------------------------------
 
 def format_rfc822_date(date_str):
-    """Converts YYYYMMDD to Mon, 01 Jan 2024 00:00:00 +0000"""
-    try:
-        if not date_str:
-            raise ValueError
-        dt = datetime.strptime(date_str, "%Y%m%d").replace(tzinfo=timezone.utc)
-        return dt.strftime("%a, %d %b %Y %H:%M:%S %z")
-    except:
-        # Fallback to now if date is missing or malformed
-        return datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S %z")
+    """Converts YYYYMMDD or ISO time strings to RFC 822 date string."""
+    dt = None
+    if isinstance(date_str, str):
+        date_str = date_str.strip()
+        if re.fullmatch(r"\d{8}", date_str):
+            try:
+                dt = datetime.strptime(date_str, "%Y%m%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                dt = None
+        else:
+            try:
+                dt = datetime.fromisoformat(date_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                else:
+                    dt = dt.astimezone(timezone.utc)
+            except Exception:
+                dt = None
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    return dt.strftime("%a, %d %b %Y %H:%M:%S %z")
+
 
 def sonarr_api_get(endpoint, params=None):
     if not CONFIG["sonarr_api_key"]: return None
@@ -74,7 +87,14 @@ def sonarr_api_get(endpoint, params=None):
         return None
 
 def get_sonarr_metadata(series_id, season, episode):
-    if not series_id: return None, "en"
+    if not series_id:
+        return None, "en"
+
+    try:
+        series_id = int(series_id)
+    except (TypeError, ValueError):
+        return None, "en"
+
     series = sonarr_api_get(f"series/{series_id}")
     series_lang = "en"
     if series:
@@ -83,22 +103,31 @@ def get_sonarr_metadata(series_id, season, episode):
             series_lang = lang_data.get('name', 'en').lower()[:2]
         elif isinstance(lang_data, str):
             series_lang = lang_data.lower()[:2]
-    
+
     episodes = sonarr_api_get("episode", {"seriesId": series_id})
     if episodes:
-        for ep in episodes:
-            if str(ep.get('seasonNumber')) == str(season) and str(ep.get('episodeNumber')) == str(episode):
-                return ep.get('title'), series_lang
+        for ep_data in episodes:
+            if str(ep_data.get('seasonNumber')) == str(season) and str(ep_data.get('episodeNumber')) == str(episode):
+                return ep_data.get('title'), series_lang
+
     return None, series_lang
 
 def get_inferred_language(entry):
-    lang = entry.get("audio_language") or entry.get("language")
-    if lang and lang != 'und': return lang.split('-')[0]
-    for key in ["subtitles", "automatic_captions"]:
-        subs = entry.get(key) or {}
-        if subs:
-            raw_key = list(subs.keys())[0]
-            return raw_key.replace('a.', '').split('-')[0]
+    preferred = entry.get("audio_language") or entry.get("language")
+    if preferred and preferred.lower() != 'und':
+        return preferred.split('-')[0].lower()
+
+    for key in ["automatic_captions", "subtitles"]:
+        caps = entry.get(key) or {}
+        if isinstance(caps, dict) and caps:
+            for raw_key in caps.keys():
+                if not raw_key:
+                    continue
+                lang_code = raw_key.replace('a.', '').split('-')[0].lower()
+                if lang_code and lang_code != 'und':
+                    return lang_code
+
+    # last resort
     return "en"
 
 def get_video_quality(entry):
@@ -124,38 +153,88 @@ def score_video(video, show_name, ep_title):
 # -----------------------------------------------------------------------------
 
 def search_youtube(query, series_id, season, ep):
-    ep_title, target_lang = get_sonarr_metadata(series_id, season, ep)
-    search_str = f'"{query}" "{ep_title}"' if ep_title else f'"{query}" S{int(season or 1):02d}E{int(ep or 1):02d}'
+    if not query:
+        return []
+
+    query = query.strip()
+    try:
+        season_int = int(season) if season is not None else 1
+    except (TypeError, ValueError):
+        season_int = 1
+    try:
+        ep_int = int(ep) if ep is not None else 1
+    except (TypeError, ValueError):
+        ep_int = 1
+
+    ep_title, target_lang = get_sonarr_metadata(series_id, season_int, ep_int)
+    search_str = f'"{query}" "{ep_title}"' if ep_title else f'"{query}" S{season_int:02d}E{ep_int:02d}'
     logger.info(f"Executing Search: {search_str} (Lang: {target_lang})")
 
     candidates = []
-    fast_opts = {"quiet": True, "extract_flat": "in_playlist", "ignoreerrors": True}
+    fast_opts = {
+        "quiet": True,
+        "ignoreerrors": True,
+        "noplaylist": True,
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+    }
+
     with yt_dlp.YoutubeDL(fast_opts) as ydl:
-        res = ydl.extract_info(f"ytsearch10:{search_str}", download=False)
-        for entry in res.get("entries", []):
-            if not entry: continue
-            if entry.get("duration") and entry.get("duration") < CONFIG["min_duration"]: continue
-            score = score_video(entry, query, ep_title)
-            if score > 0: candidates.append((score, entry))
+        try:
+            res = ydl.extract_info(f"ytsearch10:{search_str}", download=False)
+        except Exception as e:
+            logger.error(f"yt-dlp initial search failed: {e}")
+            return []
+
+    if not res or not isinstance(res, dict):
+        return []
+
+    for entry in res.get("entries", []):
+        if not entry:
+            continue
+        duration = entry.get("duration") or 0
+        if duration < CONFIG["min_duration"]:
+            continue
+        score = score_video(entry, query, ep_title)
+        if score > 0:
+            candidates.append((score, entry))
 
     final_results = []
-    top_candidates = sorted(candidates, key=lambda x: x[0], reverse=True)[:3]
-    deep_opts = {"quiet": True, "skip_download": True, "ignoreerrors": True, "geo_bypass": True, "allow_unplayable_formats": True}
+    top_candidates = sorted(candidates, key=lambda x: x[0], reverse=True)[:5]
+    deep_opts = {
+        "quiet": True,
+        "ignoreerrors": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "geo_bypass": True,
+        "source_address": "0.0.0.0",
+    }
 
     with yt_dlp.YoutubeDL(deep_opts) as ydl:
         for score, fast_entry in top_candidates:
             try:
-                v_url = fast_entry.get('url') or f"https://www.youtube.com/watch?v={fast_entry['id']}"
+                video_id = fast_entry.get('id') or fast_entry.get('url')
+                if not video_id:
+                    continue
+                v_url = fast_entry.get('url') or f"https://www.youtube.com/watch?v={video_id}"
                 info = ydl.extract_info(v_url, download=False)
-                if not info: continue
+                if not info:
+                    continue
+
                 vid_lang = get_inferred_language(info)
                 final_results.append({
-                    "id": info['id'], "title": info['title'], "url": info.get('webpage_url', v_url),
-                    "language": vid_lang, "quality": get_video_quality(info),
+                    "id": info.get('id', video_id),
+                    "title": info.get('title', 'Unknown Title'),
+                    "url": info.get('webpage_url', v_url),
+                    "language": vid_lang,
+                    "quality": get_video_quality(info),
                     "score": score + (100 if vid_lang == target_lang else 0),
-                    "duration": info.get("duration", 0), "upload_date": info.get("upload_date", "")
+                    "duration": info.get('duration', 0),
+                    "upload_date": info.get('upload_date', '')
                 })
-            except: continue
+            except Exception as e:
+                logger.warning(f"yt-dlp candidate detail fetch failed for {fast_entry.get('id')}: {e}")
+
     return sorted(final_results, key=lambda x: x['score'], reverse=True)
 
 # -----------------------------------------------------------------------------
@@ -169,17 +248,23 @@ def format_torznab_xml(videos):
 
     for video in videos:
         item = SubElement(channel, "item")
-        q = video['quality']
-        SubElement(item, "title").text = f"{video['title']} [{q} WEBDL]"
-        SubElement(item, "guid").text = hashlib.md5(video['id'].encode()).hexdigest()
-        SubElement(item, "link").text = video['url']
+        q = video.get('quality', '480p')
+        title = video.get('title', 'Unknown')
+        vid_id = video.get('id', '')
+
+        SubElement(item, "title").text = f"{title} [{q} WEBDL]"
+        guid_value = f"{vid_id}-{q}-{video.get('upload_date','')}-{video.get('language','') }"
+        SubElement(item, "guid").text = hashlib.md5(guid_value.encode('utf-8')).hexdigest()
+        SubElement(item, "link").text = video.get('url', '')
         SubElement(item, "pubDate").text = format_rfc822_date(video.get('upload_date'))
-        
-        duration_mins = (video.get('duration') or 0) / 60
+
+        duration_secs = video.get('duration') or 0
+        duration_mins = max(duration_secs / 60.0, 1)
         size_bytes = int(duration_mins * (15 if "2160" in q else 8) * 1024 * 1024)
+
         SubElement(item, "size").text = str(size_bytes)
-        SubElement(item, "enclosure", {"url": video['url'], "length": str(size_bytes), "type": "application/x-bittorrent"})
-        SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {"name": "language", "value": video['language']})
+        SubElement(item, "enclosure", {"url": video.get('url', ''), "length": str(size_bytes), "type": "application/x-bittorrent"})
+        SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {"name": "language", "value": video.get('language', 'en')})
         SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {"name": "category", "value": "5000"})
         SubElement(item, "{http://torznab.com/schemas/2015/feed}attr", {"name": "seeders", "value": "100"})
 
@@ -203,16 +288,31 @@ class TorznabHandler(BaseHTTPRequestHandler):
             if not q or q.strip() == "":
                 logger.info("Empty query (Prowlarr test). Returning valid dummy RSS.")
                 dummy = [{
-                    "id": "prowlarr_test", "title": "YouTube Indexer Connection Test", 
-                    "url": "https://youtube.com", "language": "en", "quality": "1080p", 
+                    "id": "prowlarr_test", "title": "YouTube Indexer Connection Test",
+                    "url": "https://youtube.com", "language": "en", "quality": "1080p",
                     "score": 100, "duration": 600, "upload_date": "20260101"
                 }]
                 self._send_xml('<?xml version="1.0" encoding="UTF-8"?>\n' + format_torznab_xml(dummy))
                 return
-            videos = search_youtube(q, params.get("seriesid", [None])[0], params.get("season", ["1"])[0], params.get("ep", ["1"])[0])
+
+            series_id = params.get("seriesid", [None])[0]
+            season = params.get("season", ["1"])[0]
+            ep = params.get("ep", ["1"])[0]
+            videos = search_youtube(q, series_id, season, ep)
             self._send_xml('<?xml version="1.0" encoding="UTF-8"?>\n' + format_torznab_xml(videos))
+
         elif action == "caps":
-            self._send_xml('<caps><server title="YouTube"/><searching><search available="yes" supportedParams="q"/><tv-search available="yes" supportedParams="q,season,ep,seriesid"/></searching></caps>')
+            self._send_xml('<?xml version="1.0" encoding="UTF-8"?>\n'
+                           + '<caps><server title="YouTube" version="1.0"/><searching>'
+                           + '<search available="yes" supportedParams="q"/>'
+                           + '<tv-search available="yes" supportedParams="q,season,ep,seriesid"/>'
+                           + '</searching></caps>')
+
+        else:
+            self.send_response(400)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Invalid request: missing or bad 't' parameter")
 
 if __name__ == "__main__":
     if not HAS_YTDLP: print("yt-dlp missing.")
