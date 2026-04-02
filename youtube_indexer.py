@@ -173,12 +173,7 @@ def get_inferred_language(entry):
 
     candidates = []
 
-    # 1) Primary video language from yt-dlp metadata
-    primary_lang = entry.get('language')
-    if primary_lang and isinstance(primary_lang, str) and primary_lang.lower() != 'und':
-        candidates.append(primary_lang)
-
-    # 2) Automatic captions (user-generated, reliable for spoken language)
+    # 1) Automatic captions (best indicator of spoken language if available)
     auto_caps = entry.get("automatic_captions") or {}
     if isinstance(auto_caps, dict):
         for raw_key in auto_caps.keys():
@@ -188,7 +183,7 @@ def get_inferred_language(entry):
             if code and code != 'und':
                 candidates.append(code)
 
-    # 3) Explicit subtitles (uploaded by creator, good for non-English)
+    # 2) Explicit subtitles (indicates available language options)
     subs = entry.get("subtitles") or {}
     if isinstance(subs, dict):
         for raw_key in subs.keys():
@@ -198,7 +193,7 @@ def get_inferred_language(entry):
             if code and code != 'und':
                 candidates.append(code)
 
-    # 4) Requested subtitles (similar to above)
+    # 3) Requested subtitles
     req_subs = entry.get("requested_subtitles") or {}
     if isinstance(req_subs, dict):
         for raw_key in req_subs.keys():
@@ -207,6 +202,11 @@ def get_inferred_language(entry):
             code = raw_key.split('-')[0].lower()
             if code and code != 'und':
                 candidates.append(code)
+
+    # 4) Primary video language from yt-dlp metadata
+    primary_lang = entry.get('language')
+    if primary_lang and isinstance(primary_lang, str) and primary_lang.lower() != 'und':
+        candidates.append(primary_lang)
 
     # 5) Audio language from track
     audio_lang = entry.get("audio_language")
@@ -221,6 +221,18 @@ def get_inferred_language(entry):
                 fmt_lang = f.get('language') or f.get('audio_language')
                 if fmt_lang and isinstance(fmt_lang, str) and fmt_lang.lower() != 'und':
                     candidates.append(fmt_lang)
+
+    # 6) Fallback to formats
+    if not candidates:
+        formats = entry.get('formats') or []
+        for f in formats:
+            if isinstance(f, dict):
+                fmt_lang = f.get('language') or f.get('audio_language')
+                if fmt_lang and isinstance(fmt_lang, str) and fmt_lang.lower() != 'und':
+                    candidates.append(fmt_lang)
+
+    # Debug log candidates
+    logger.debug(f"Language candidates for {entry.get('id', 'unknown')}: {candidates}")
 
     # Return first valid normalized code
     for candidate in candidates:
@@ -289,6 +301,7 @@ def search_youtube(query, series_id, season, ep):
         "skip_download": True,
         "allsubtitles": True,
         "writeautomaticsub": False,
+        "js_runtimes": ["node"],
     }
 
     with yt_dlp.YoutubeDL(fast_opts) as ydl:
@@ -322,6 +335,7 @@ def search_youtube(query, series_id, season, ep):
         "source_address": "0.0.0.0",
         "allsubtitles": True,
         "writeautomaticsub": False,
+        "js_runtimes": ["node"],
     }
 
     with yt_dlp.YoutubeDL(deep_opts) as ydl:
